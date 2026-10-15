@@ -5,6 +5,12 @@ can trace through them without a graph break. Each :class:`All2All`
 instance registers itself in a class-level registry indexed by an integer
 ``comm_id``; the custom op takes that id, an input tensor, and the instance's
 IPC buffer, and dispatches to the appropriate C++ runtime.
+
+When peer device access is unavailable on any rank (no NVLink/PCIe P2P), CUDA IPC
+cannot be opened. In that case :class:`All2All` runs ``allgather`` through host
+memory instead (D2H -> gloo exchange -> H2D). The decision is made collectively, so
+every rank takes the same path. ``send_recv_heads`` and ``gather_heads`` still
+require P2P.
 """
 
 import math
@@ -44,10 +50,19 @@ def _gather_heads_fake(x: torch.Tensor, buffer: torch.Tensor, comm_id: int) -> N
     return None
 
 
+def _local_peer_access_ok(rank: int, world_size: int) -> bool:
+    """True if this rank's GPU can access every other rank's GPU directly (P2P)."""
+    if not torch.cuda.is_available():
+        return False
+    return all(torch.cuda.can_device_access_peer(rank, peer) for peer in range(world_size) if peer != rank)
+
+
 class All2All:
     """IPC-based All2All communication for distributed head-parallel attention.
     This class manages GPU memory buffers and IPC handles to enable efficient
-    cross-GPU communication for attention head redistribution.
+    cross-GPU communication for attention head redistribution. If any rank lacks
+    peer access, ``allgather`` falls back to a host-staged path and the head
+    redistribution ops are unavailable.
     Args:
         rank: Local rank of this process.
         world_size: Total number of processes in the distributed group.
@@ -101,13 +116,27 @@ class All2All:
         All2All._runtime_registry[self._comm_id] = self.runtime
         self._finalizer = weakref.finalize(self, All2All._release_comm, self._comm_id, self.runtime)
 
-        # Exchange IPC handles across all ranks
-        ipc_handles: list[Any] = [None] * world_size
-        local_ipc_handle = self.runtime.get_local_ipc_handle()
-        dist.all_gather_object(ipc_handles, local_ipc_handle, group)
+        # Exchange IPC handles and peer-access capability across all ranks. The capability
+        # flag is gathered too, so every rank picks the same path.
+        local_handle = self.runtime.get_local_ipc_handle()
+        gathered: list[Any] = [None] * world_size
+        dist.all_gather_object(gathered, (_local_peer_access_ok(rank, world_size), local_handle), group)
+        self._staged = not all(ok for ok, _ in gathered)
 
-        self.runtime.sync(ipc_handles)
-        self._buffer = self.runtime.local_buffer()
+        if self._staged:
+            # IPC mappings cannot be opened without peer access, so skip sync() and the
+            # IPC buffer. allgather goes through host memory on a CPU (gloo) group.
+            self._buffer = None
+            pg = group if group is not None else dist.group.WORLD
+            self._cpu_group = dist.new_group(ranks=dist.get_process_group_ranks(pg), backend="gloo")
+        else:
+            self.runtime.sync([handle for _, handle in gathered])
+            self._buffer = self.runtime.local_buffer()
+
+    @property
+    def uses_host_staging(self) -> bool:
+        """True when allgather runs through host memory (no peer access on some rank)."""
+        return self._staged
 
     def set_timeout_seconds(self, seconds: float) -> None:
         """Set the all2all barrier (deadlock-detection) timeout, in seconds.
@@ -119,6 +148,13 @@ class All2All:
             raise ValueError(f"all2all timeout seconds must be finite and non-negative, got {seconds}")
         self.runtime.set_timeout_seconds(seconds)
 
+    def _require_p2p(self, op: str) -> None:
+        if self._staged:
+            raise RuntimeError(
+                f"All2All.{op} requires peer (P2P) access, which is unavailable on at least one rank. "
+                "Only allgather has a host-staged fallback."
+            )
+
     def send_recv_heads(self, x: torch.Tensor, *, copy_out: bool = False) -> torch.Tensor:
         """Exchange attention heads across ranks (All2All pattern).
         Args:
@@ -128,6 +164,7 @@ class All2All:
             Output tensor with redistributed heads. Unless ``copy_out``, a view of the IPC
             buffer that the next call on this instance overwrites.
         """
+        self._require_p2p("send_recv_heads")
         torch.ops.ltx_kernels.send_recv_heads(x, self._buffer, self._comm_id)
         batch, tokens, heads, head_dim = x.shape
         out = self._buffer[: x.numel()].view(batch, tokens * self.world_size, heads // self.world_size, head_dim)
@@ -142,6 +179,7 @@ class All2All:
             Output tensor with gathered heads. Unless ``copy_out``, a view of the IPC buffer
             that the next call on this instance overwrites.
         """
+        self._require_p2p("gather_heads")
         torch.ops.ltx_kernels.gather_heads(x, self._buffer, self._comm_id)
         batch, tokens, heads, head_dim = x.shape
         out = self._buffer[: x.numel()].view(batch, tokens // self.world_size, heads * self.world_size, head_dim)
@@ -149,13 +187,36 @@ class All2All:
 
     def allgather(self, x: torch.Tensor, *, copy_out: bool = False) -> torch.Tensor:
         """Allgather operation across all ranks.
+        Uses CUDA IPC when peer access is available. Otherwise stages through host memory
+        (D2H -> gloo all_gather -> H2D). The host path always returns a new tensor.
         Args:
-            x: Input tensor to gather.
+            x: Input tensor of shape [batch, seqlen, heads, head_dim], contiguous, on this rank's GPU.
             copy_out: If True, copy result to a new tensor instead of using buffer.
         Returns:
-            Gathered tensor from all ranks.
+            Gathered tensor of shape [batch, seqlen * world_size, heads, head_dim].
         """
+        if self._staged:
+            return self._allgather_host_staged(x)
         return self.runtime.allgather(x, copy_out)
+
+    def _allgather_host_staged(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4 or not x.is_contiguous() or not x.is_cuda or x.dtype != self.tensor_dtype:
+            raise ValueError("host-staged allgather expects a contiguous 4-D CUDA tensor of the configured dtype")
+        if x.device.index != self.rank:
+            raise ValueError(f"input must live on cuda:{self.rank}, got {x.device}")
+
+        batch, seqlen, heads, head_dim = x.shape
+        # D2H: transport raw bytes so every dtype (including float8) goes through gloo.
+        host = x.reshape(-1).view(torch.uint8).cpu()
+        gathered = [torch.empty_like(host) for _ in range(self.world_size)]
+        dist.all_gather(gathered, host, group=self._cpu_group)
+
+        # Reassemble to [batch, world * seqlen, heads, head_dim]: rank r's tokens go at
+        # offset r * seqlen, matching the IPC allgather kernel layout.
+        parts = torch.stack([g.view(x.dtype).view(x.shape) for g in gathered])  # [world, B, S, H, D]
+        out = parts.permute(1, 0, 2, 3, 4).reshape(batch, self.world_size * seqlen, heads, head_dim)
+        # H2D
+        return out.to(x.device)
 
     def destroy(self) -> None:
         """Release IPC handles and GPU memory buffers."""
