@@ -147,6 +147,31 @@ def shutdown_usp(ctx: UspContext | None) -> None:
     destroy_distributed_environment()
 
 
+# -- attention backend ------------------------------------------------------------------------------
+
+# yunchang AttnType members to try, in order, when no backend is requested. Names differ across
+# yunchang releases (e.g. "TORCH" is not present in 0.6.x), so the choice is made at runtime.
+_ATTN_PREFERENCE = ("TORCH_FLASH", "TORCH_EFFICIENT", "TORCH_MATH")
+
+
+def resolve_attn_type(requested: str | None = None) -> object:
+    """Return the yunchang ``AttnType`` member to use for xDiT attention.
+
+    With ``requested`` set, that exact member must exist. Otherwise the first member of
+    ``_ATTN_PREFERENCE`` that exists in the installed yunchang is used.
+    """
+    from yunchang.kernels import AttnType  # noqa: PLC0415
+
+    candidates = (requested,) if requested else _ATTN_PREFERENCE
+    for name in candidates:
+        if hasattr(AttnType, name):
+            logger.info("USP attention backend: %s", name)
+            return getattr(AttnType, name)
+    raise RuntimeError(
+        f"None of {list(candidates)} exist in yunchang AttnType; available: {list(AttnType.__members__)}"
+    )
+
+
 # -- sequence shard / gather helpers ---------------------------------------------------------------
 
 
@@ -205,16 +230,15 @@ def _padded_key_bias(ctx: UspContext, total_keys: int, like: torch.Tensor) -> to
 class UspSelfAttention(AttentionCallable):
     """Unmasked video self-attention via xDiT's Ulysses + Ring ``xFuserLongContextAttention``."""
 
-    def __init__(self, ctx: UspContext, attn_type: str = "TORCH") -> None:
+    def __init__(self, ctx: UspContext, attn_type: str | None = None) -> None:
         self._ctx = ctx
         self._attn_type = attn_type
         self._usp: torch.nn.Module | None = None
 
     def _build(self) -> torch.nn.Module:
         from xfuser.core.long_ctx_attention import xFuserLongContextAttention  # noqa: PLC0415
-        from yunchang.kernels import AttnType  # noqa: PLC0415
 
-        return xFuserLongContextAttention(attn_type=getattr(AttnType, self._attn_type))
+        return xFuserLongContextAttention(attn_type=resolve_attn_type(self._attn_type))
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int) -> torch.Tensor:
         if self._usp is None:
@@ -279,7 +303,7 @@ class UspMaskedGatherKVAttention(MaskedAttentionCallable):
         return self._original_masked(q, k, v, heads, mask)
 
 
-def create_usp_module_ops(ctx: UspContext, attn_type: str = "TORCH") -> ModuleOps:
+def create_usp_module_ops(ctx: UspContext, attn_type: str | None = None) -> ModuleOps:
     """ModuleOps patching video self-attention (``attn1``) and video-to-audio attention for SP."""
 
     def mutator(module: torch.nn.Module) -> torch.nn.Module:
@@ -331,7 +355,7 @@ class UspModelWrapper(torch.nn.Module):
         return video_out, audio_out
 
 
-def enable_usp(stage: DiffusionStage, ctx: UspContext, attn_type: str = "TORCH") -> DiffusionStage:
+def enable_usp(stage: DiffusionStage, ctx: UspContext, attn_type: str | None = None) -> DiffusionStage:
     """Return a copy of a :class:`~ltx_pipelines.utils.blocks.DiffusionStage` running with SP."""
     heads = stage._transformer_builder.model_config().get("transformer", {}).get("num_attention_heads")
     if heads is not None and heads % ctx.ulysses_degree != 0:
@@ -349,6 +373,7 @@ __all__ = [
     "gather_sequence",
     "init_usp",
     "padded_length",
+    "resolve_attn_type",
     "resolve_usp_degrees",
     "shard_bounds",
     "shard_sequence",
