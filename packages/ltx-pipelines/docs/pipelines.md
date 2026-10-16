@@ -139,6 +139,17 @@ Two-stage audio-to-video generation. Stage 1 generates video at half resolution 
 
 **Use when:** You have an audio clip and want to generate a matching video, audio-reactive video generation, or music visualization.
 
+**Multi-GPU (xDiT USP sequence parallelism):** launch with `torchrun`, one rank per GPU, after `pip install xfuser` (plus its `yunchang` dependency). `--ulysses-degree` (default `WORLD_SIZE // --ring-degree`) times `--ring-degree` (default 1) must equal `WORLD_SIZE`; the Ulysses degree must also divide the transformer's attention head count.
+
+```bash
+torchrun --nproc_per_node=4 -m ltx_pipelines.a2vid_two_stage \
+    --ulysses-degree 2 --ring-degree 2 \
+    --checkpoint-path ... --distilled-lora ... --spatial-upsampler-path ... --gemma-root ... \
+    --audio-path in.wav --prompt "..." --output-path out.mp4
+```
+
+Video tokens are sharded across ranks inside the transformer (RoPE positions follow the same shard, video-to-audio attention gathers the global video keys/values). Noise, audio latents and text/image conditioning are replicated, so every rank sees the same noise for a given `--seed`. Only rank 0 runs the VAE decode and writes the file; all ranks join every collective and finish with a barrier. Single-GPU runs (no `torchrun`) never import `xfuser`. `--compile` / CUDA-graph capture have not been tested with sequence parallelism. Implementation: [`utils/usp.py`](../src/ltx_pipelines/utils/usp.py).
+
 ---
 
 ## 8. RetakePipeline

@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -46,6 +47,9 @@ from ltx_core.multigpu.transformer.sequence_parallel import (
     pad_modality_for_uniform_sharding,
     tile_modality_for_rank,
 )
+
+if TYPE_CHECKING:
+    from ltx_pipelines.utils.blocks import DiffusionStage
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +196,8 @@ def _all_gather_seq(x: torch.Tensor, ctx: UspContext) -> torch.Tensor:
 def _padded_key_bias(ctx: UspContext, total_keys: int, like: torch.Tensor) -> torch.Tensor:
     """Additive ``(1, 1, 1, T_pad)`` bias hiding the padded video keys."""
     bias = torch.zeros(1, 1, 1, total_keys, dtype=like.dtype, device=like.device)
-    assert ctx.valid_tokens is not None
+    if ctx.valid_tokens is None:
+        raise RuntimeError("padded-key bias requested outside a UspModelWrapper forward")
     bias[..., ctx.valid_tokens :] = torch.finfo(like.dtype).min
     return bias
 
@@ -326,7 +331,7 @@ class UspModelWrapper(torch.nn.Module):
         return video_out, audio_out
 
 
-def enable_usp(stage, ctx: UspContext, attn_type: str = "TORCH"):  # noqa: ANN001, ANN201
+def enable_usp(stage: DiffusionStage, ctx: UspContext, attn_type: str = "TORCH") -> DiffusionStage:
     """Return a copy of a :class:`~ltx_pipelines.utils.blocks.DiffusionStage` running with SP."""
     heads = stage._transformer_builder.model_config().get("transformer", {}).get("num_attention_heads")
     if heads is not None and heads % ctx.ulysses_degree != 0:
