@@ -62,13 +62,13 @@ class MyRunner(MGPURunner):
 from ltx_pipelines.multigpu import MGPUController
 
 controller = MGPUController(MyRunner, num_gpus=8)
-controller.start(model_paths=ModelPaths.from_monolith("...", "..."))  # setup kwargs
+controller.start(model_paths=ModelPaths.from_monolith("...", "..."))   # setup kwargs
 stream = controller.stream(prompt="a cat", seed=42)
 try:
-    for item in stream:  # one element per yield, as it arrives (NOT gathered across ranks)
+    for item in stream:      # one element per yield, as it arrives (NOT gathered across ranks)
         show(item)
 finally:
-    stream.drain()  # free the controller even on early exit
+    stream.drain()           # free the controller even on early exit
 controller.shutdown()
 ```
 

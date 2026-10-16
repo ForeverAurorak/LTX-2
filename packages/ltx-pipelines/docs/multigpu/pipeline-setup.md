@@ -26,12 +26,8 @@ registry = ModelRegistry()
 
 # 2. Build the normal pipeline, handing it the registry.
 pipeline = TI2VidTwoStagesPipeline(
-    model_paths=...,
-    distilled_lora=...,
-    spatial_upsampler_path=...,
-    loras=[],
-    registry=registry,
-    quantization=...,
+    model_paths=..., distilled_lora=..., spatial_upsampler_path=...,
+    loras=[], registry=registry, quantization=...,
 )
 
 # 3. One weight tracker per transformer process group (shared by the stages).
@@ -39,17 +35,12 @@ tracker = TransformerWeightTracker(group=self.groups.transformer_group)
 
 # 4. Swap each block's builder.
 pipeline.stage_1._transformer_builder = SequenceParallelBuilder(
-    inner=pipeline.stage_1._transformer_builder,
-    attn_mgr=attn_mgr,
-    registry=registry,
-    tracker=tracker,
+    inner=pipeline.stage_1._transformer_builder, attn_mgr=attn_mgr,
+    registry=registry, tracker=tracker,
 )
 pipeline.stage_2._transformer_builder = TiledDataParallelBuilder(
-    inner=pipeline.stage_2._transformer_builder,
-    group=self.groups.transformer_group,
-    tiling=tdp_tiling,
-    registry=registry,
-    tracker=tracker,
+    inner=pipeline.stage_2._transformer_builder, group=self.groups.transformer_group,
+    tiling=tdp_tiling, registry=registry, tracker=tracker,
 )
 pipeline.prompt_encoder._text_encoder_builder = AccelerateGemmaBuilder(...)
 pipeline.video_decoder._decoder_builder = DistributedDecoderBuilder(...)
