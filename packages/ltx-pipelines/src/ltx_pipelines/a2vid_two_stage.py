@@ -1,3 +1,18 @@
+"""Two-stage audio-to-video generation, optionally multi-GPU with xDiT USP sequence parallelism.
+
+Single GPU::
+
+    python -m ltx_pipelines.a2vid_two_stage --audio-path in.wav --prompt "..." ...
+
+Multi-GPU (one rank per GPU, requires ``pip install xfuser``; ``ulysses * ring == nproc_per_node``)::
+
+    torchrun --nproc_per_node=4 -m ltx_pipelines.a2vid_two_stage \\
+        --ulysses-degree 2 --ring-degree 2 --audio-path in.wav --prompt "..." ...
+
+Video tokens are sharded across ranks inside the transformer; noise, audio and text conditioning are
+replicated, so results match single-GPU for the same seed. Only rank 0 decodes and writes the output.
+"""
+
 import argparse
 import logging
 from collections.abc import Iterator, Sequence
@@ -76,6 +91,7 @@ from ltx_pipelines.utils.media_io import (
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import ImageConditioningInput, OffloadMode, PipelineOutput, VideoAudio
+from ltx_pipelines.utils.usp import enable_usp, init_usp, shutdown_usp
 
 logger = logging.getLogger(__name__)
 
@@ -401,10 +417,13 @@ class A2VidPipelineTwoStage:
         chunk_config: ChunkConfig | None = None,
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
-    ) -> tuple[Iterator[DecodedChunk], int, TilingConfig]:
+        decode: bool = True,
+    ) -> tuple[Iterator[DecodedChunk] | Iterator[Chunk], int, TilingConfig]:
         """Generate a video as a stream of decoded chunks.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
         Audio is the frozen source latent both stages; decoded output is the original waveform.
+        ``decode=False`` returns the refined (undecoded) latent chunks instead; multi-GPU non-main
+        ranks drain that iterator so they join every denoising collective without running the VAE.
         """
         ctx = self._prepare_run(
             prompt=prompt,
@@ -481,6 +500,8 @@ class A2VidPipelineTwoStage:
             fps=frame_rate,
             freeze_audio=True,
         )
+        if not decode:
+            return refined, ctx.num_frames, ctx.tiling_config
         decoded = decode_chunks(
             refined,
             self.video_decoder,
@@ -553,6 +574,18 @@ def build_a2vid_arg_parser(params: PipelineParams) -> argparse.ArgumentParser:
             f"--num-frames / --frame-rate ({params.num_frames} frames)."
         ),
     )
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=None,
+        help="xDiT Ulysses sequence-parallel degree (torchrun only; default: WORLD_SIZE // --ring-degree).",
+    )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=1,
+        help="xDiT Ring sequence-parallel degree (torchrun only); --ulysses-degree * --ring-degree == WORLD_SIZE.",
+    )
     for action in parser._actions:
         if "--num-frames" in action.option_strings:
             action.default = None
@@ -591,6 +624,11 @@ def main() -> None:
     parser = add_chunk_layout_args(add_keyframe_decode_arg(add_generated_keyframes_arg(build_a2vid_arg_parser(params))))
     args = parser.parse_args()
     num_frames, audio_max_duration = resolve_a2vid_duration_or_exit(parser, args, default_num_frames=params.num_frames)
+    try:
+        usp = init_usp(args.ulysses_degree, args.ring_degree)
+    except ValueError as e:
+        parser.error(str(e))
+        raise  # parser.error always exits; keep the type checker happy
     pipeline = A2VidPipelineTwoStage(
         model_paths=args.model_paths,
         distilled_lora=args.distilled_lora,
@@ -602,6 +640,9 @@ def main() -> None:
         prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
         diffvae_optimization=args.diffvae_optimization,
     )
+    if usp is not None:
+        pipeline.stage_1 = enable_usp(pipeline.stage_1, usp)
+        pipeline.stage_2 = enable_usp(pipeline.stage_2, usp)
     hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     chunk_config = chunk_config_from_args(args)
@@ -636,7 +677,14 @@ def main() -> None:
         chunk_config=chunk_config,
         generated_keyframes=args.num_generated_keyframes,
         decode_with_keyframes=args.decode_with_keyframes,
+        decode=usp is None or usp.is_main,
     )
+    if usp is not None and not usp.is_main:
+        # Drain the lazy stream so this rank joins every denoising collective; rank 0 decodes and writes.
+        for _ in chunks:
+            pass
+        shutdown_usp(usp)
+        return
     if chunk_config is not None:
         video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
         video_chunks_number = 1
@@ -657,6 +705,7 @@ def main() -> None:
         color_space=hdr,
         audio_sampling_rate=audio_sampling_rate,
     )
+    shutdown_usp(usp)
 
 
 if __name__ == "__main__":
